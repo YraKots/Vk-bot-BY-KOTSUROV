@@ -1,0 +1,37 @@
+{
+  "vk_token": "vk1.a.0T66-7Ps8Z-1BqbICoaTg3zEt4CukAQa7NWbkOy6rnw_nPfqKC_DUTjUgw2FTOZNx7L0vEKD5flr2bjOkpb1d6fAoPWfYM-jjbTkLppWDNQm4--IggkU8LF1Cq0PYeUELfh0Sknf1f6BwEdZljTZb4yBiXNdqGVSzUhZxVQOkySgbVU0aho4V_zgXE94jmU3KtiQhZ95UDmj8uMgEXjvww",
+  "group_id": 240367640,
+  "admin_ids": [
+    827997763
+  ],
+  "whitelist_enabled": false,
+  "whitelist_ids": [],
+  "target_chats": [],
+  "target_groups": [],
+  "advertised_id": 240367640,
+  "greeting_message": "👋 Всем привет! Я бот для пиара vk.com/club240367640",
+  "spam_messages": [
+    "Подпишись на vk.com/club240367640 — там крутой контент!",
+    "Залетайте в vk.com/club240367640, у нас движуха",
+    "vk.com/club240367640 — лучшее сообщество, подписывайся!"
+  ],
+  "post_messages": [
+    "Новый пост в vk.com/club240367640 — заходите!",
+    "Ежедневный контент уже в vk.com/club240367640",
+    "Подписывайтесь на vk.com/club240367640, там свежие новости!"
+  ],
+  "min_delay": 30,
+  "max_delay": 90,
+  "spam_interval_hours": 6,
+  "max_per_day": 50,
+  "post_times": [
+    "10:00",
+    "14:00",
+    "18:00"
+  ],
+  "stats": {
+    "sent_today": 0,
+    "total_sent": 0,
+    "last_reset": ""
+  }
+}

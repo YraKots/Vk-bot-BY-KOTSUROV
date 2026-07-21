@@ -1,0 +1,6 @@
+services:
+  - type: worker
+    name: vk-autopiar-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python botap.py
