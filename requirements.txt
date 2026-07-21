@@ -1,3 +1,5 @@
 vk-api
+flask
+gunicorn
 schedule
 requests
