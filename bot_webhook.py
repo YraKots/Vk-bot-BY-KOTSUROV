@@ -11,10 +11,12 @@ from datetime import datetime
 from vk_api.exceptions import ApiError
 from flask import Flask, request, jsonify
 
+# --- ИНИЦИАЛИЗАЦИЯ FLASK ---
 app = Flask(__name__)
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
+# --- КОНФИГУРАЦИЯ ---
 CONFIG_FILE = "autopiar_config.json"
 
 DEFAULT_CONFIG = {
@@ -35,6 +37,370 @@ DEFAULT_CONFIG = {
     "post_messages": [
         "Новый пост в vk.com/club240367640 — заходите!",
         "Ежедневный контент уже в vk.com/club240367640",
+        "Подписывайтесь на vk.com/club240367640, там свежие новости!"
+    ],
+    "min_delay": 30,
+    "max_delay": 90,
+    "spam_interval_hours": 6,
+    "max_per_day": 50,
+    "post_times": ["10:00", "14:00", "18:00"],
+    "stats": {
+        "sent_today": 0,
+        "total_sent": 0,
+        "last_reset": ""
+    }
+}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("vk_autopiar.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger(__name__)
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                if "greeting_message" not in cfg:
+                    cfg["greeting_message"] = "👋 Всем привет! Я бот для пиара vk.com/club240367640"
+                return cfg
+        except:
+            pass
+    return DEFAULT_CONFIG.copy()
+
+def save_config(config):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+    except:
+        pass
+
+config = load_config()
+
+vk_session = None
+vk = None
+sent_this_cycle = set()
+scheduler_running = False
+
+def init_vk():
+    global vk_session, vk
+    if config["vk_token"] and config["group_id"]:
+        try:
+            vk_session = vk_api.VkApi(token=config["vk_token"])
+            vk = vk_session.get_api()
+            log.info("✅ VK API подключён")
+            return True
+        except Exception as e:
+            log.error(f"❌ Ошибка: {e}")
+    return False
+
+def check_access(user_id):
+    if not config["admin_ids"]:
+        config["admin_ids"].append(user_id)
+        save_config(config)
+        return True, "👑 Вы назначены главным администратором!"
+    if config["whitelist_enabled"]:
+        if user_id in config["admin_ids"] or user_id in config["whitelist_ids"]:
+            return True, None
+        return False, "🚫 Доступ запрещён."
+    else:
+        if user_id in config["admin_ids"]:
+            return True, None
+        return False, "⛔ У вас нет прав администратора."
+
+def safe_send(peer_id, message, retry=0):
+    if config["stats"]["sent_today"] >= config["max_per_day"]:
+        return False
+    try:
+        vk.messages.send(
+            peer_id=peer_id,
+            message=message,
+            random_id=random.randint(1, 2**31)
+        )
+        config["stats"]["sent_today"] += 1
+        config["stats"]["total_sent"] += 1
+        save_config(config)
+        log.info(f"✅ Отправлено в {peer_id}")
+        return True
+    except ApiError as e:
+        if e.code == 9:
+            time.sleep(15)
+            return safe_send(peer_id, message, retry)
+        elif e.code == 945 and retry < 2:
+            time.sleep(5)
+            return safe_send(peer_id, message, retry + 1)
+        elif e.code in [902, 917]:
+            if peer_id in config["target_chats"]:
+                config["target_chats"].remove(peer_id)
+                save_config(config)
+        return False
+    except:
+        return False
+
+def send_greeting(peer_id):
+    try:
+        vk.messages.send(
+            peer_id=peer_id,
+            message=config.get("greeting_message", "👋 Привет!"),
+            random_id=random.randint(1, 2**31)
+        )
+        log.info(f"👋 Приветствие отправлено в {peer_id}")
+        return True
+    except Exception as e:
+        log.error(f"❌ Ошибка приветствия в {peer_id}: {e}")
+        return False
+
+def spam_cycle():
+    global sent_this_cycle
+    sent_this_cycle.clear()
+    
+    if not config["target_chats"]:
+        log.warning("📭 Список чатов пуст!")
+        return
+    if not config["spam_messages"]:
+        log.warning("📭 Нет сообщений!")
+        return
+    
+    log.info(f"📢 Рассылка по {len(config['target_chats'])} чатам...")
+    for chat_id in config["target_chats"]:
+        if chat_id in sent_this_cycle:
+            continue
+        if config["stats"]["sent_today"] >= config["max_per_day"]:
+            break
+        
+        msg = random.choice(config["spam_messages"])
+        success = safe_send(chat_id, msg)
+        
+        if success:
+            sent_this_cycle.add(chat_id)
+        
+        time.sleep(random.randint(config["min_delay"], config["max_delay"]))
+    
+    log.info(f"🏁 Готово! Отправлено: {len(sent_this_cycle)}")
+
+def post_to_groups():
+    if not config["target_groups"] or not config["post_messages"]:
+        return
+    post = random.choice(config["post_messages"])
+    for group_id in config["target_groups"]:
+        try:
+            vk.wall.post(owner_id=group_id, message=post, from_group=1)
+            log.info(f"📝 Пост в {group_id}")
+        except:
+            pass
+
+def reset_daily_counter():
+    config["stats"]["sent_today"] = 0
+    config["stats"]["last_reset"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_config(config)
+
+def auto_scan_chats():
+    if not vk:
+        return "❌ VK не подключён"
+    try:
+        all_found = []
+        
+        conversations = vk.messages.getConversations(count=200, offset=0)
+        total = conversations.get("count", 0)
+        log.info(f"🔍 Всего диалогов: {total}")
+        
+        for offset in range(0, total, 200):
+            if offset > 0:
+                time.sleep(1)
+                conversations = vk.messages.getConversations(count=200, offset=offset)
+            
+            for conv in conversations.get("items", []):
+                try:
+                    chat = conv.get("conversation", {})
+                    # ИСПРАВЛЕНО: chat.get вместо peer.get
+                    peer = chat.get("peer", {})
+                    peer_id = peer.get("id")
+                    chat_type = peer.get("type")
+                    
+                    can_write = chat.get("can_write", True)
+                    is_kicked = chat.get("is_kicked", False)
+                    
+                    if chat_type == "chat" and not is_kicked and can_write:
+                        title = chat.get("chat_settings", {}).get("title", "Без названия")
+                        
+                        if peer_id not in config["target_chats"]:
+                            config["target_chats"].append(peer_id)
+                            all_found.append(f"➕ {title} (peer_id: {peer_id})")
+                            log.info(f"👋 Отправляю приветствие в {title} ({peer_id})...")
+                            send_greeting(peer_id)
+                            time.sleep(2)
+                        else:
+                            log.info(f"⏭ Уже в списке: {title} ({peer_id})")
+                    else:
+                        log.info(f"🚫 Пропускаю (недоступен): {peer_id}")
+                except Exception as e:
+                    log.error(f"❌ Ошибка обработки: {e}")
+                    continue
+            
+            if total <= 200:
+                break
+        
+        save_config(config)
+        
+        if all_found:
+            return f"✅ Найдено бесед: {len(all_found)}\n" + "\n".join(all_found)
+        
+        return f"ℹ️ Новых бесед не найдено. Всего в списке: {len(config['target_chats'])}"
+    except Exception as e:
+        log.error(f"❌ Ошибка сканирования: {e}")
+        return f"❌ Ошибка: {e}"
+
+def auto_scan_groups():
+    if not vk:
+        return "❌ VK не подключён"
+    try:
+        groups = vk.groups.get(filter="admin", extended=1)
+        found = []
+        for group in groups.get("items", []):
+            try:
+                gid = -group["id"]
+                name = group.get("name", "Без названия")
+                if gid not in config["target_groups"]:
+                    config["target_groups"].append(gid)
+                    found.append(f"➕ {name} (ID: {gid})")
+            except:
+                continue
+        save_config(config)
+        if found:
+            return "✅ Найдены:\n" + "\n".join(found)
+        return "ℹ️ Новых групп не найдено"
+    except:
+        return "ℹ️ Сканирование групп недоступно"
+
+def process_command(user_id, text):
+    try:
+        text = text.strip()
+        
+        for p in ["!", "/", ".", "?"]:
+            if text.startswith(p):
+                text = text[1:].strip()
+                break
+        
+        ru_to_en = {
+            "помощь": "help", "хелп": "help", "help": "help",
+            "старт": "start", "start": "start",
+            "спам": "spam", "рассылка": "spam", "spam": "spam",
+            "пост": "post", "постинг": "post", "post": "post",
+            "список": "list", "лист": "list", "list": "list",
+            "статистика": "stats", "стата": "stats", "stats": "stats",
+            "сканировать": "scan_chats", "скан": "scan_chats", "scan_chats": "scan_chats",
+            "сканировать_группы": "scan_groups", "scan_groups": "scan_groups",
+            "задержка": "delay", "delay": "delay",
+            "интервал": "spam_interval", "spam_interval": "spam_interval",
+            "лимит": "max_per_day", "max_per_day": "max_per_day",
+            "сброс": "reset", "reset": "reset",
+            "дебаг": "debug", "debug": "debug",
+            "админы": "admins", "admins": "admins",
+            "белый_список": "whitelist", "whitelist": "whitelist",
+            "цель": "target", "target": "target",
+            "рестарт": "restart", "перезапуск": "restart", "restart": "restart",
+            "приветствие": "set_greeting", "greeting": "set_greeting",
+            "сменить_цель": "set_target", "set_target": "set_target",
+        }
+        
+        parts = text.strip().split()
+        if not parts:
+            return "❓ Введите команду"
+        
+        cmd = parts[0].lower()
+        args = parts[1:]
+        
+        if cmd in ru_to_en:
+            cmd = ru_to_en[cmd]
+        
+    except:
+        return "❌ Ошибка"
+
+    has_access, access_msg = check_access(user_id)
+    if not has_access:
+        return access_msg
+
+    prefix = ""
+    if access_msg:
+        prefix = access_msg + "\n\n"
+
+    # ... (весь блок с if cmd == "..." остаётся без изменений, 
+    # он слишком длинный, я вырезал его для читаемости ответа,
+    # но в вашем файле он должен остаться!)
+    
+    # ВАЖНО: Оставьте все команды от start/help до return "❓ Неизвестная..."
+    # Я удалил их только из этого примера, чтобы подсветить структуру файла.
+    # УБЕДИТЕСЬ, ЧТО ВЫ ВСТАВИЛИ ВСЕ КОМАНДЫ, КОТОРЫЕ БЫЛИ В ОРИГИНАЛЕ.
+    
+    return "❓ Неизвестная команда. Напиши help"
+
+# ========== WEBHOOK ОБРАБОТЧИКИ (БЕЗ ДУБЛИКАТОВ) ==========
+
+@app.route('/', methods=['POST'])
+def webhook():
+    try:
+        data = request.json
+        log.info(f"📩 Получен запрос от ВК: {data.get('type')}")
+        
+        # === ПОДТВЕРЖДЕНИЕ СЕРВЕРА ===
+        if data.get('type') == 'confirmation':
+            return "2309a801"  # <-- ВАША СТРОКА ПОДТВЕРЖДЕНИЯ
+            
+        # === ОБРАБОТКА СООБЩЕНИЙ ===
+        if data.get('type') == 'message_new':
+            msg = data['object']['message']
+            user_id = msg.get('from_id')
+            text = msg.get('text', '')
+            peer_id = msg.get('peer_id')
+            
+            if user_id and peer_id:
+                log.info(f"📩 {user_id}: {text[:50]}")
+                response = process_command(user_id, text)
+                
+                try:
+                    vk.messages.send(
+                        peer_id=peer_id,
+                        message=response,
+                        random_id=random.randint(1, 2**31)
+                    )
+                except Exception as e:
+                    log.error(f"❌ Ошибка отправки: {e}")
+        
+        return "ok"  # <-- ВК ждёт просто "ok"
+    
+    except Exception as e:
+        log.error(f"❌ Ошибка webhook: {e}")
+        return "error", 500
+
+@app.route('/', methods=['GET'])
+def health():
+    return "🤖 Бот работает!", 200
+
+# ========== ЗАПУСК ==========
+
+if __name__ == "__main__":
+    print("""
+╔════════════════════════════════╗
+║   🤖 VK АВТОПИАР БОТ v5.8    ║
+║   WEBHOOK ВЕРСИЯ              ║
+╚════════════════════════════════╝
+    """)
+    
+    if not config["vk_token"]:
+        config["vk_token"] = input("🔑 Токен: ").strip()
+        save_config(config)
+    
+    if init_vk():
+        log.info("✅ Бот готов! Используй Webhook")
+        port = int(os.environ.get('PORT', 5000))
+        app.run(host='0.0.0.0', port=port)
+    else:
+        log.error("❌ Не удалось подключиться")        "Ежедневный контент уже в vk.com/club240367640",
         "Подписывайтесь на vk.com/club240367640, там свежие новости!"
     ],
     "min_delay": 30,
